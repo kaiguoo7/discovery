@@ -109,7 +109,7 @@ fi
 
 #支持模糊匹配
 case "$1" in 
-    show|sho*)
+    show|sh*)
         shift
         discovery_show "$@"
     ;;

@@ -30,7 +30,7 @@
 #define PRINT_INTERVAL          5
 #define QUEUE_LEN               512     /* 队列长度 */
 #define BUF_LEN                 2048
-#define OUT_TIMES               3
+#define OUT_TIMES               2
 #define MASTER_CHANGE_EVENT     "master_change"
 #define SN_BROADCAST            "FFFFFFFFFFFFF" /* SN广播，与正常的SN长度一样，13位 */
 
@@ -1138,7 +1138,8 @@ end:
     pthread_mutex_unlock(&g_master_mutex);
 
     if (changed == true) {
-        DISC_DEBUG("Update master info\n");
+        DISC_DEBUG("Update master info, [SN]: %s, [IP]%s\n", g_master_info->devInfo.sn, g_master_info->devInfo.ip);
+        DISC_FILE("Found master, [SN]: %s, [IP]: %s\n", g_master_info->devInfo.sn, g_master_info->devInfo.ip);
         (void)disc_master_change_notify(g_master_info->devInfo.sn, g_master_info->devInfo.ip);
     }
 
@@ -1285,6 +1286,7 @@ static int disc_handle_request(disc_msg_t* msg)
     if ( node == NULL) {
         return -1;
     }
+    DISC_DEBUG("receive requset message from %s\n", node->devInfo.sn);
 
     if (strcmp(node->devInfo.networkId, g_dev_info->networkId) != 0 || *(node->devInfo.role) != ROLE_MASTER) {
         goto end;
@@ -1301,15 +1303,12 @@ static int disc_handle_request(disc_msg_t* msg)
     
         case ROLE_SLAVER:
             (void)disc_update_master_info(&node->devInfo);
-            DISC_DEBUG("Update master info\n");
         break;
 
         case ROLE_UNKNOWN:
             (void)disc_set_role(ROLE_SLAVER);
             (void)disc_set_networkName(node->devInfo.networkName);
             (void)disc_update_master_info(&node->devInfo);
-            DISC_DEBUG("Found master, [sn]: %s, [ip]: %s\n", g_master_info->devInfo.sn, g_master_info->devInfo.ip);
-            DISC_FILE("Found master, [sn]: %s, [ip]: %s\n", g_master_info->devInfo.sn, g_master_info->devInfo.ip);
         break;
         
         default:
@@ -1319,7 +1318,7 @@ static int disc_handle_request(disc_msg_t* msg)
 end: 
     /* 回复response报文 */
     if (disc_send_msg(MSG_TYPE_RESPONSE, node->devInfo.ip) == 0) {
-        DISC_DEBUG("Send response message success\n");
+        DISC_DEBUG("Send response message to %s\n", node->devInfo.sn);
     } else {
         DISC_ERROR("Send response message failed\n");
     }
@@ -1352,6 +1351,7 @@ static int disc_handle_hello(disc_msg_t* msg)
     if ( node == NULL) {
         return -1;
     }
+    DISC_DEBUG("receive hello message from %s\n", node->devInfo.sn);
 
     if (strcmp(node->devInfo.networkId, g_dev_info->networkId) != 0 || *(node->devInfo.role) != ROLE_MASTER) {
         goto end;
@@ -1374,8 +1374,8 @@ static int disc_handle_hello(disc_msg_t* msg)
             (void)disc_update_master_info(&node->devInfo);
             /* 信息变更后，广播一次hello报文，保证大家更新邻居信息 */
             (void)disc_send_broadcast_msg(MSG_TYPE_HELLO, SN_BROADCAST);
-            DISC_DEBUG("Found master, [sn]: %s, [ip]: %s\n", g_master_info->devInfo.sn, g_master_info->devInfo.ip);
-            DISC_FILE("Found master, [sn]: %s, [ip]: %s\n", g_master_info->devInfo.sn, g_master_info->devInfo.ip);
+            
+            
         break;
         default:
         break;
@@ -1404,6 +1404,7 @@ static int disc_handle_merge(disc_msg_t* msg)
         DISC_WARNING("The message is to me, drop it\n");
         return -1;
     }
+    DISC_DEBUG("receive merge message from %s\n", node->devInfo.sn);
 
     /* 判读对方是否为master，不是master不处理发来的merge消息 */
     if (*(node->devInfo.role) != ROLE_MASTER) {
@@ -1430,13 +1431,20 @@ end:
 
 static int disc_handle_reject(disc_msg_t* msg)
 {
-    dev_node_t* node;
-
-    node = disc_parse_payload(msg->payload, msg->msgHdr.encType, NULL);
-    if ( node == NULL) {
+    dev_node_t* node = NULL;
+    char* destSn = NULL;
+    
+    node = disc_parse_payload(msg->payload, msg->msgHdr.encType, &destSn);
+    if ( node == NULL || destSn == NULL) {
         return -1;
     }
 
+    /* 根据destSn, 判断消息是否是发送给自己的 */
+    if (strcmp(destSn, g_dev_info->sn) != 0 || strcmp(destSn, SN_BROADCAST) != 0) {
+        goto end;
+    }
+    DISC_DEBUG("receive reject message from %s\n", node->devInfo.sn);
+    
     /* 若networkId不同，则不处理reject报文 */
     if (strcmp(g_dev_info->networkId, node->devInfo.networkId) != 0) {
         goto end;
@@ -1477,8 +1485,10 @@ static int disc_handle_declare(disc_msg_t* msg)
 
     /* 自身角色为master或自身mac地址更大，则发送reject报文 */
     if( disc_get_role() == ROLE_MASTER || strcmp(g_dev_info->mac, node->devInfo.mac) > 0) {
-        if (disc_send_msg(MSG_TYPE_REJECT, node->devInfo.ip) != 0) {
-            DISC_ERROR("Broadcast reject message failed\n");
+        if (disc_send_broadcast_msg(MSG_TYPE_REJECT, node->devInfo.sn) != 0) {
+            DISC_ERROR("Send reject message failed\n");
+        } else {
+            DISC_DEBUG("Send reject message to %s\n", node->devInfo.sn);
         }
     }
 
@@ -1496,27 +1506,21 @@ static int disc_msg_handler(disc_msg_t* msg)
     
     switch (msg->msgHdr.msgType) {
         case MSG_TYPE_DECLARE:
-            //DISC_DEBUG("receive declare message\n");
             disc_handle_declare(msg);
         break;
         case MSG_TYPE_REJECT:
-            //DISC_DEBUG("receive reject message\n");
             disc_handle_reject(msg);
         break;
         case MSG_TYPE_MERGE:
-            DISC_DEBUG("receive merge message\n");
             disc_handle_merge(msg);
         break;
         case MSG_TYPE_HELLO:
-            //DISC_DEBUG("receive hello message\n");
             disc_handle_hello(msg);
         break;
         case MSG_TYPE_REQUEST:
-            DISC_DEBUG("receive request message\n");
             disc_handle_request(msg);
         break;
         case MSG_TYPE_RESPONSE:
-            DISC_DEBUG("receive response message\n");
             disc_handle_response(msg);
         break;
         default:
@@ -2200,11 +2204,11 @@ static void disc_send_timer_cb(struct uloop_timeout *timer)
             /* 若连续3个declare，为收到reject, 则自身为master */
             if (g_declare_count >= 3) {
                 (void)disc_set_role(ROLE_MASTER);
-                (void)disc_update_master_info(g_dev_info);
-                if (g_master_info->devInfo.ip != NULL) {
-                    free(g_master_info->devInfo.ip);
+                if (g_dev_info->ip != NULL) {
+                    free(g_dev_info->ip);
                 }
-                g_master_info->devInfo.ip = strdup("127.0.0.1");
+                g_dev_info->ip = strdup("127.0.0.1");
+                (void)disc_update_master_info(g_dev_info);
                 g_declare_count = 0;
                 goto end;
             } 
@@ -2238,8 +2242,8 @@ static void disc_send_timer_cb(struct uloop_timeout *timer)
 
 end:
     if (disc_get_role() == ROLE_UNKNOWN) {
-        /* 角色未确定前，定时器设置为5S */
-            uloop_timeout_set(g_send_timer, 5 * 1000);
+        /* 角色未确定前，定时器设置为 3S */
+            uloop_timeout_set(g_send_timer, 3 * 1000);
     } else {
         /* 角色确定后，定时器设置为 bcast_period */
         uloop_timeout_set(g_send_timer, g_dev_cfg->bcast_period * 1000);
