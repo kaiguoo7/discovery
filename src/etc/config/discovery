@@ -1,0 +1,7 @@
+config discovery discovery
+	option networkId '0'
+	option networkName 'default'
+	option hello_enable 'false'
+	option bcast_period '20'
+	option port '36521'
+	option ifname 'br-wan'

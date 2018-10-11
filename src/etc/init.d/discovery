@@ -1,0 +1,53 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=10
+
+log_dir="/tmp/discovery/"
+
+generate_dev_json_info(){
+    local dev_info='/tmp/discovery/dev_info.json'
+    local sn mac productModel software hardware
+    
+    . /usr/share/libubox/jshn.sh
+    json_init
+    sn=$(uci -q get sysinfo.@sysinfo[0].serial_num)
+    json_add_string sn  "$sn"
+    
+    mac=$(uci -q get sysinfo.@sysinfo[0].sys_mac)
+    json_add_string mac  "$mac"
+    
+    productModel=$(uci -q get sysinfo.@sysinfo[0].product_class)
+    json_add_string productModel   "$productModel"
+    
+    software=$(uci -q get sysinfo.@sysinfo[0].software_version)
+    json_add_string software "$software"
+    
+    hardware=$(uci -q get sysinfo.@sysinfo[0].hardware_version)
+    json_add_string hardware "$hardware"
+    
+    json_dump > "$dev_info"
+    json_cleanup
+}
+
+start() {
+    [ ! -e "$log_dir" ] && mkdir -p "$log_dir"
+    generate_dev_json_info
+    echo "starting discovery..."
+    /usr/sbin/discovery.elf > /dev/null 2>&1 &
+}
+
+stop() {
+    killall -9 discovery.elf 2>/dev/null
+    echo "discovery has stoped."
+}
+
+boot() {
+    start "$@"
+}
+
+restart() {
+    trap '' TERM
+    stop "$@"
+    start "$@"
+}

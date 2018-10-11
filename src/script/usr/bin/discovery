@@ -1,0 +1,138 @@
+#!/bin/sh
+
+usage()
+{
+    cat <<EOF
+Usage: 
+    $(basename $0)  <debug|show>  <option>
+    
+debug:
+    $(basename $0) debug open         # open debug inform 
+    $(basename $0) debug close        # close debug inform
+    
+show:
+    $(basename $0) show role          # show role inform
+    $(basename $0) show master        # show master inform
+    $(basename $0) show neighbor      # show neighbor inform
+  
+EOF
+    exit 1
+}
+
+discovery_debug()
+{
+    local status="open"
+    local module="all"
+    local level="debug"
+    local tty="/dev/null"
+    
+    [ -n "$1" ] && status="$1"
+    [ -n "$2" ] && module="$2"
+    [ -n "$3" ] && level="$3"
+    
+    # 获取当前终端的tty
+    tty=$(tty 2> /dev/null)
+    if [ -z "$tty" ];then
+        tty="/dev/null"
+    fi
+    
+    [ "$status" = "close" ]&& [ -z "$2" ] && {
+        level="error"
+        tty="/dev/null"
+    }
+    
+    . /usr/share/libubox/jshn.sh
+    json_init
+    json_add_string module  "$module"
+    json_add_string status  "$status"
+    json_add_string level   "$level"
+    json_add_string tty     "$tty"
+
+    context=`json_dump`
+    #echo "$context"
+
+    # 调用 ubus 发送
+    ubus -t 3 call discovery.debug set "$context"
+}
+
+discovery_show() 
+{
+    # 支持模糊匹配
+    case "$1" in 
+        neighbor|neig*) 
+            if [ -n "$2" ];then
+                ubus -t 3 call discovery neighbor "$2"
+            else
+                ubus -t 3 call discovery neighbor
+            fi
+        ;;
+        role) 
+            ubus -t 3 call discovery role
+        ;;
+        master|mas*) 
+            ubus -t 3 call discovery master
+        ;;
+        cfg) 
+            ubus -t 3 call discovery cfg
+        ;;
+        status) 
+            ubus -t 3 call discovery status
+        ;;
+        *) 
+            usage
+        ;;
+    esac
+    
+}
+
+discovery_restart()
+{
+    /etc/init.d/discovery restart 2>/dev/null
+}
+
+discovery_stop()
+{
+    /etc/init.d/discovery stop 2>/dev/null
+}
+
+discovery_detect()
+{
+    #探测邻居信息
+    ubus -t 3 call discovery detect
+}
+
+# 主流程
+if [ -z "$1" ];then
+    discovery_debug close
+    usage
+fi
+
+#支持模糊匹配
+case "$1" in 
+    show|sho*)
+        shift
+        discovery_show "$@"
+    ;;
+    debug|deb*)
+        shift
+        discovery_debug "$@"
+    ;;
+    close|clo*) 
+        discovery_debug "close"
+    ;;
+    detect|det*) 
+        discovery_detect
+    ;;
+    start|restart) 
+        discovery_restart
+    ;;
+    stop) 
+        discovery_stop
+    ;;
+    -h|--help|*) 
+        usage
+    ;;
+esac
+
+
+
