@@ -77,6 +77,8 @@ static int disc_merge_network(struct ubus_context* ctx, struct ubus_object* obj,
     struct ubus_request_data* req, const char* method, struct blob_attr* msg);
 static int disc_show_neighbor(struct ubus_context* ctx, struct ubus_object* obj,
     struct ubus_request_data* req, const char* method, struct blob_attr* msg);
+static int disc_exec_shell(struct ubus_context* ctx, struct ubus_object* obj,
+    struct ubus_request_data* req, const char* method, struct blob_attr* msg);
 static int disc_show_cfg(struct ubus_context* ctx, struct ubus_object* obj,
     struct ubus_request_data* req, const char* method, struct blob_attr* msg);
 static int disc_show_status(struct ubus_context* ctx, struct ubus_object* obj,
@@ -90,11 +92,19 @@ static int disc_neighbor_detect(struct ubus_context* ctx, struct ubus_object* ob
 static char* disc_role_to_string(role_t role);
 static int disc_send_raw_packet(char* data, int data_len, uint32_t source_nip, int source_port,
 		uint32_t dest_nip, int dest_port, const uint8_t *dest_arp, int ifindex);
-static int disc_send_broadcast_msg(msg_type_t msgType, const char* destSn);
-static int disc_send_unicast_msg(msg_type_t msgType, const char* ip);
+static int disc_send_broadcast_msg(disc_msg_t* msg, const char* destSn);
+static int disc_send_unicast_msg(disc_msg_t* msg, const char* destIp);
+static int disc_send_msg(msg_type_t msgType, enc_type_t encType, const char* destSn);
 static int disc_get_role(void);
-static int disc_send_msg(msg_type_t msgType, const char* ip);
 static void disc_free_neighbor_list(void);
+static int disc_send_declare(const char* destSn);
+static int disc_send_reject(const char* destSn);
+static int disc_send_merge(const char* destSn);
+static int disc_send_hello(const char* destSn);
+static int disc_send_request(const char* destSn);
+static int disc_send_response(const char* destIp,const char* destSn);
+static int disc_send_shell(const char* cmds, const char* destSn);
+
 
 
 
@@ -105,6 +115,7 @@ enum {
     DISC_SOFTWARE,
     DISC_HARDWARE,
     DISC_SN,
+    DISC_CMDS,
     DISC_MAX
 };
 
@@ -114,11 +125,13 @@ static const struct blobmsg_policy disc_policy[DISC_MAX] = {
     [DISC_SOFTWARE] = { .name = "software", .type = BLOBMSG_TYPE_STRING },
     [DISC_HARDWARE] = { .name = "hardware", .type = BLOBMSG_TYPE_STRING },
     [DISC_SN] = { .name = "sn", .type = BLOBMSG_TYPE_STRING },
+    [DISC_CMDS] = { .name = "cmds", .type = BLOBMSG_TYPE_STRING },
 };
 
 static const struct ubus_method disc_methods[] = {
     UBUS_METHOD("merge", disc_merge_network, disc_policy),
     UBUS_METHOD("neighbor", disc_show_neighbor, disc_policy),
+    UBUS_METHOD("shell", disc_exec_shell, disc_policy),
     { .name = "cfg", .handler = disc_show_cfg },
     { .name = "status", .handler = disc_show_status },
     { .name = "role", .handler = disc_show_role },
@@ -164,7 +177,7 @@ static int disc_merge_network(struct ubus_context* ctx, struct ubus_object* obj,
             continue;
         }
 
-        (void)disc_send_broadcast_msg(MSG_TYPE_MERGE, tmp->devInfo.sn);
+        (void)disc_send_merge(tmp->devInfo.sn);
     }
 
     pthread_mutex_unlock(&g_list_mutex);
@@ -182,7 +195,6 @@ static int disc_show_neighbor(struct ubus_context* ctx, struct ubus_object* obj,
     int count = 0;
     
     memset(&b, 0, sizeof(struct blob_buf));
-    
     blob_buf_init(&b, 0);
 
     array = blobmsg_open_array(&b, "list");
@@ -235,6 +247,46 @@ end:
     ubus_send_reply(ctx, req, b.head);
     
     blob_buf_free(&b);
+    
+    return 0;
+}
+
+static int disc_exec_shell(struct ubus_context* ctx, struct ubus_object* obj,
+    struct ubus_request_data* req, const char* method, struct blob_attr* msg)
+{
+    struct blob_attr* tb[DISC_MAX];
+    char* cmds = NULL;
+    char* destSn = NULL;
+    struct blob_buf b;
+    
+    memset(&b, 0, sizeof(struct blob_buf));
+    blobmsg_parse(disc_policy, DISC_MAX, tb, blob_data(msg), blob_len(msg));
+    
+    if(tb[DISC_CMDS]) {
+        cmds = blobmsg_data(tb[DISC_CMDS]);
+    }
+
+    if(tb[DISC_SN]) {
+        destSn = blobmsg_data(tb[DISC_SN]);
+    } 
+
+    if (cmds == NULL) {
+        memset(&b, 0, sizeof(struct blob_buf));
+        blob_buf_init(&b, 0);
+        blobmsg_add_string(&b, "msg", "Error: Not find cmds");
+        ubus_send_reply(ctx, req, b.head);
+        blob_buf_free(&b);
+        return -1;
+    }
+
+    if(tb[DISC_SN] == NULL) {
+        destSn = SN_BROADCAST;
+    } 
+
+    if(disc_send_shell(cmds, destSn) != 0) {
+        DISC_ERROR("Send shell message failed\n");
+    }
+
     
     return 0;
 }
@@ -400,7 +452,7 @@ static int disc_neighbor_detect(struct ubus_context* ctx, struct ubus_object* ob
 {
     (void) disc_free_neighbor_list();
 
-    if (disc_send_broadcast_msg(MSG_TYPE_REQUEST, SN_BROADCAST) != 0 ) {
+    if (disc_send_request(SN_BROADCAST) != 0 ) {
         DISC_ERROR("Send request message failed\n");
     }
 
@@ -515,10 +567,6 @@ end:
 static int disc_foreach_neighbor_list(void)
 {
     dev_node_t *tmp, *n;
-
-    if(g_dev_cfg->hello_enable == false) {
-        return 0;
-    }
     
     pthread_mutex_lock(&g_list_mutex);
     
@@ -1161,6 +1209,7 @@ static dev_node_t* disc_parse_payload(char* payload, enc_type_t encType, char** 
     devNode = (dev_node_t*)malloc(sizeof(dev_node_t));
     if (devNode == NULL) {
         DISC_ERROR("malloc() %d bytes failed\n", sizeof(dev_node_t));
+        json_object_put(root);
         goto end;
     }
     memset(devNode, 0, sizeof(dev_node_t));
@@ -1182,8 +1231,6 @@ static dev_node_t* disc_parse_payload(char* payload, enc_type_t encType, char** 
     if (node == NULL) {
         DISC_ERROR("Not find sn\n");
         json_object_put(root);
-        free(node);
-        node = NULL;
         goto end;
     } else {
         str = json_object_get_string(node);
@@ -1278,6 +1325,51 @@ static dev_node_t* disc_parse_payload(char* payload, enc_type_t encType, char** 
     return devNode;
 }
 
+static char* disc_parse_shell_msg(char* payload, enc_type_t encType, char** destSn)
+{
+    struct json_object *root, *node;
+    const char* str;
+    char* cmdsBuf = NULL;
+    int len = 0;
+    
+    root = json_tokener_parse(payload);
+    if (is_error(root)) {
+        DISC_ERROR("json_tokener_parse() failed\n");
+        goto end;
+    }
+
+    /* destSn */
+    if (destSn != NULL) {
+        node = json_object_object_get(root, "destSn");
+        if (node == NULL) {
+            DISC_ERROR("Not find destSn\n");
+            *destSn = NULL;
+        } else {
+            str = json_object_get_string(node);
+            *destSn = strdup(str);
+        }
+    }
+
+    /* cmds */
+    node = json_object_object_get(root, "cmds");
+    if (node == NULL) {
+        DISC_ERROR("Not find cmds\n");
+        json_object_put(root);
+        goto end;
+    } else {
+        str = json_object_get_string(node);
+        len = strlen(str)+2;
+        cmdsBuf = malloc(len);
+        memset(cmdsBuf, 0, len);
+        snprintf(cmdsBuf, len, "%s&", str);/* 追加一个&，避免命令执行卡住 */
+    }
+    
+    json_object_put(root);
+end:
+    
+    return cmdsBuf;
+}
+
 static int disc_handle_request(disc_msg_t* msg)
 {
     dev_node_t* node = NULL;
@@ -1295,7 +1387,7 @@ static int disc_handle_request(disc_msg_t* msg)
     switch (disc_get_role()) {
         case ROLE_MASTER:
             if(strcmp(g_dev_info->mac, node->devInfo.mac) > 0) {
-                if (disc_send_msg(MSG_TYPE_MERGE, node->devInfo.ip) != 0) {
+                if (disc_send_merge(node->devInfo.sn) != 0) {
                     DISC_ERROR("Send merge message failed\n");
                 }
             }
@@ -1317,7 +1409,7 @@ static int disc_handle_request(disc_msg_t* msg)
 
 end: 
     /* 回复response报文 */
-    if (disc_send_msg(MSG_TYPE_RESPONSE, node->devInfo.ip) == 0) {
+    if (disc_send_response(node->devInfo.ip, node->devInfo.sn) == 0) {
         DISC_DEBUG("Send response message to %s\n", node->devInfo.sn);
     } else {
         DISC_ERROR("Send response message failed\n");
@@ -1360,8 +1452,8 @@ static int disc_handle_hello(disc_msg_t* msg)
     switch(disc_get_role()) {
         case ROLE_MASTER:
             if(strcmp(g_dev_info->mac, node->devInfo.mac) > 0) {
-                if (disc_send_msg(MSG_TYPE_MERGE, node->devInfo.ip) != 0) {
-                    DISC_ERROR("disc_send_broadcast_msg() failed\n");
+                if (disc_send_merge(node->devInfo.sn) != 0) {
+                    DISC_ERROR("Send merge message failed\n");
                 }
             }
         break;
@@ -1373,7 +1465,7 @@ static int disc_handle_hello(disc_msg_t* msg)
             (void)disc_set_networkName(node->devInfo.networkName);
             (void)disc_update_master_info(&node->devInfo);
             /* 信息变更后，广播一次hello报文，保证大家更新邻居信息 */
-            (void)disc_send_broadcast_msg(MSG_TYPE_HELLO, SN_BROADCAST);
+            (void)disc_send_hello(SN_BROADCAST);
             
             
         break;
@@ -1417,7 +1509,7 @@ static int disc_handle_merge(disc_msg_t* msg)
     (void)disc_set_networkName(node->devInfo.networkName);
     (void)disc_update_master_info(&node->devInfo);
     /* 信息变更后，广播一次hello报文，保证大家更新邻居信息 */
-    (void)disc_send_broadcast_msg(MSG_TYPE_HELLO, SN_BROADCAST);
+    (void)disc_send_hello(SN_BROADCAST);
     DISC_FILE("Found master, [sn]: %s, [ip]: %s\n", g_master_info->devInfo.sn, g_master_info->devInfo.ip);
 
 end:
@@ -1440,7 +1532,7 @@ static int disc_handle_reject(disc_msg_t* msg)
     }
 
     /* 根据destSn, 判断消息是否是发送给自己的 */
-    if (strcmp(destSn, g_dev_info->sn) != 0 || strcmp(destSn, SN_BROADCAST) != 0) {
+    if (strcmp(destSn, g_dev_info->sn) != 0 && strcmp(destSn, SN_BROADCAST) != 0) {
         goto end;
     }
     DISC_DEBUG("receive reject message from %s\n", node->devInfo.sn);
@@ -1456,7 +1548,7 @@ static int disc_handle_reject(disc_msg_t* msg)
         (void)disc_set_networkName(node->devInfo.networkName); 
         (void)disc_update_master_info(&node->devInfo);
         /* 信息变更后，广播一次hello报文，保证大家更新邻居信息 */
-        (void)disc_send_broadcast_msg(MSG_TYPE_HELLO, SN_BROADCAST);
+        (void)disc_send_hello(SN_BROADCAST);
         DISC_FILE("Found master, [sn]: %s, [ip]: %s\n", g_master_info->devInfo.sn, g_master_info->devInfo.ip);
     }
 
@@ -1485,7 +1577,7 @@ static int disc_handle_declare(disc_msg_t* msg)
 
     /* 自身角色为master或自身mac地址更大，则发送reject报文 */
     if( disc_get_role() == ROLE_MASTER || strcmp(g_dev_info->mac, node->devInfo.mac) > 0) {
-        if (disc_send_broadcast_msg(MSG_TYPE_REJECT, node->devInfo.sn) != 0) {
+        if (disc_send_reject(node->devInfo.sn) != 0) {
             DISC_ERROR("Send reject message failed\n");
         } else {
             DISC_DEBUG("Send reject message to %s\n", node->devInfo.sn);
@@ -1494,6 +1586,37 @@ static int disc_handle_declare(disc_msg_t* msg)
 
 end:
     (void)disc_update_neighbor_info(node);
+    
+    return 0;
+}
+
+static int disc_handle_shell(disc_msg_t* msg)
+{
+    char* destSn = NULL;
+    char* cmdsBuf = NULL;
+
+    cmdsBuf = disc_parse_shell_msg(msg->payload, msg->msgHdr.encType, &destSn);
+    if( cmdsBuf == NULL || destSn == NULL) {
+        goto end;
+    }
+    
+    /* 根据destSn, 判断消息是否是发送给自己的 */
+    if (strcmp(destSn, g_dev_info->sn) != 0 && strcmp(destSn, SN_BROADCAST) != 0) {
+        goto end;
+    }
+    DISC_DEBUG("receive shell message, [cmds]: %s\n", cmdsBuf);
+
+    /* 执行命令 */
+    system(cmdsBuf);
+
+end:
+    if (cmdsBuf) {
+        free(cmdsBuf);
+    }
+
+    if (destSn) {
+        free(destSn);
+    }
     
     return 0;
 }
@@ -1522,6 +1645,9 @@ static int disc_msg_handler(disc_msg_t* msg)
         break;
         case MSG_TYPE_RESPONSE:
             disc_handle_response(msg);
+        break;
+        case MSG_TYPE_SHELL:
+            disc_handle_shell(msg);
         break;
         default:
             DISC_ERROR("Unknown msgType\n");
@@ -1863,7 +1989,7 @@ end:
 	return ret;    
 }
 
-static int disc_get_msg_payload(char** payload, int* payloadLen, const char* destSn, enc_type_t encType) 
+static int disc_get_msg_payload(char** payload, int* payloadLen, enc_type_t encType, const char* destSn) 
 {
     struct json_object *root;
     const char* str;
@@ -1904,79 +2030,62 @@ static int disc_get_msg_payload(char** payload, int* payloadLen, const char* des
     return 0;
 }      
 
-static int disc_send_broadcast_msg(msg_type_t msgType, const char* destSn)
+static int disc_send_broadcast_msg(disc_msg_t* msg, const char* destSn)
 {
-    int ret = 0;
     int len = 0;
-    char* send_buf = NULL;
+    char send_buf[BUF_LEN] = {0};
     int ifindex;
-    disc_msg_t* msg = NULL;
     uint8_t MAC_BCAST_ADDR[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
-    if (disc_read_interface(g_dev_cfg->ifname, &ifindex, NULL, NULL) != 0) {
-        DISC_ERROR("disc_read_interface() failed\n");
-        ret = -1;
-        goto end;
-    }
-
-    msg = (disc_msg_t*)malloc(sizeof(disc_msg_t));
-    if (msg == NULL) {
-        DISC_ERROR("malloc() %d bytes failed\n", sizeof(disc_msg_t));
-        ret = -1;
-        goto end;
-    }
-    memset(msg, 0, sizeof(disc_msg_t));
-    msg->msgHdr.version = htonl(VERISON_DEFAULT);
-    msg->msgHdr.msgType = htonl(msgType);
-    msg->msgHdr.encType = htonl(ENC_TYPE_NONE);
-    if(disc_get_msg_payload(&msg->payload, &msg->msgHdr.payloadLen, destSn,  ENC_TYPE_NONE) != 0 ) {
-        DISC_ERROR("Get msg payload failed\n");
-        ret =  -1;
-        goto end;
-    }
-
     len = sizeof(disc_msg_hdr_t) + msg->msgHdr.payloadLen;
-    msg->msgHdr.payloadLen = htonl(msg->msgHdr.payloadLen);
-
-    send_buf = malloc(len+1);
-    if (send_buf == NULL) {
-        DISC_ERROR("malloc() %d bytes failed\n", len);
-        ret = -1;
-        goto end;
+    if (len > BUF_LEN) {
+        DISC_ERROR("msg length is big than %d, drop it\n", BUF_LEN);
+        return -1;
     }
-    memset(send_buf, 0, len+1);
     
+    msg->msgHdr.version = htonl(msg->msgHdr.version);
+    msg->msgHdr.msgType = htonl(msg->msgHdr.msgType);
+    msg->msgHdr.encType = htonl(msg->msgHdr.encType);
+    msg->msgHdr.payloadLen = htonl(msg->msgHdr.payloadLen);
+    
+    memset(send_buf, 0, BUF_LEN);
     memcpy(send_buf, &msg->msgHdr, sizeof(msg->msgHdr));
     memcpy(send_buf+sizeof(msg->msgHdr), msg->payload, len-sizeof(msg->msgHdr));
     //DISC_DEBUG("Send msg->payload: %s\n", send_buf+sizeof(msg->msgHdr));
-    
-    ret = disc_send_raw_packet(send_buf, len, INADDR_ANY, g_dev_cfg->port+1, 
-                INADDR_BROADCAST, g_dev_cfg->port, MAC_BCAST_ADDR, ifindex);
 
-end:
-    /* 释放内存 */
-    if (send_buf != NULL) {
-        free(send_buf);
-    }
-
-    if (msg != NULL) {
-        disc_free_msg(msg);
+    if (disc_read_interface(g_dev_cfg->ifname, &ifindex, NULL, NULL) != 0) {
+        DISC_ERROR("disc_read_interface() failed\n");
+        return -1;
     }
     
-    return ret;
-    
+    return disc_send_raw_packet(send_buf, len, INADDR_ANY, g_dev_cfg->port+1, 
+                INADDR_BROADCAST, g_dev_cfg->port, MAC_BCAST_ADDR, ifindex);    
 }
 
-static int disc_send_unicast_msg(msg_type_t msgType, const char* ip)
+static int disc_send_unicast_msg(disc_msg_t* msg, const char* destIp)
 {
     int ret = 0;
     int len = 0;
-    char* send_buf = NULL;
-    disc_msg_t* msg = NULL;
+    char send_buf[BUF_LEN] = {0};
     int opt = 1;
     int sockfd = -1;
     struct sockaddr_in dest_addr;
 
+    len = sizeof(disc_msg_hdr_t) + msg->msgHdr.payloadLen;
+    if (len > BUF_LEN) {
+        DISC_ERROR("msg length is big than %d, drop it\n", BUF_LEN);
+        return -1;
+    }
+
+    msg->msgHdr.version = htonl(msg->msgHdr.version);
+    msg->msgHdr.msgType = htonl(msg->msgHdr.msgType);
+    msg->msgHdr.encType = htonl(msg->msgHdr.encType);
+    msg->msgHdr.payloadLen = htonl(msg->msgHdr.payloadLen);
+
+    memset(send_buf, 0, BUF_LEN);
+    memcpy(send_buf, &msg->msgHdr, sizeof(msg->msgHdr));
+    memcpy(send_buf+sizeof(msg->msgHdr), msg->payload, len-sizeof(msg->msgHdr));
+    
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sockfd < 0) {
 		DISC_ERROR("socket() failed\n");
@@ -1993,38 +2102,7 @@ static int disc_send_unicast_msg(msg_type_t msgType, const char* ip)
     memset(&dest_addr, 0, sizeof(dest_addr));
 	dest_addr.sin_family = AF_INET;
 	dest_addr.sin_port = htons(g_dev_cfg->port);
-    dest_addr.sin_addr.s_addr=inet_addr(ip);
-
-    msg = (disc_msg_t*)malloc(sizeof(disc_msg_t));
-    if (msg == NULL) {
-        DISC_ERROR("malloc() %d bytes failed\n", sizeof(disc_msg_t));
-        ret = -1;
-        goto end;
-    }
-    memset(msg, 0, sizeof(disc_msg_t));
-    msg->msgHdr.version = htonl(VERISON_DEFAULT);
-    msg->msgHdr.msgType = htonl(msgType);
-    msg->msgHdr.encType = htonl(ENC_TYPE_NONE);
-    if(disc_get_msg_payload(&msg->payload, &msg->msgHdr.payloadLen, SN_BROADCAST, ENC_TYPE_NONE) != 0 ) {
-        DISC_ERROR("Get msg payload failed\n");
-        ret =  -1;
-        goto end;
-    }
-
-    len = sizeof(disc_msg_hdr_t) + msg->msgHdr.payloadLen;
-    msg->msgHdr.payloadLen = htonl(msg->msgHdr.payloadLen);
-
-    send_buf = malloc(len+1);
-    if (send_buf == NULL) {
-        DISC_ERROR("malloc() %d bytes failed\n", len);
-        ret = -1;
-        goto end;
-    }
-    memset(send_buf, 0, len+1);
-    
-    memcpy(send_buf, &msg->msgHdr, sizeof(msg->msgHdr));
-    memcpy(send_buf+sizeof(msg->msgHdr), msg->payload, len-sizeof(msg->msgHdr));
-    //DISC_DEBUG("Send msg->payload: %s\n", send_buf+sizeof(msg->msgHdr));
+    dest_addr.sin_addr.s_addr=inet_addr(destIp);
     
     len = sendto(sockfd, send_buf, len, 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
     if (len < 0) {
@@ -2040,15 +2118,6 @@ static int disc_send_unicast_msg(msg_type_t msgType, const char* ip)
     ret = 0;
     
 end:
-    /* 释放内存 */
-    if (send_buf != NULL) {
-        free(send_buf);
-    }
-
-    if (msg != NULL) {
-        disc_free_msg(msg);
-    }
-
     if (sockfd != -1) {
         close(sockfd);
     }
@@ -2056,23 +2125,185 @@ end:
     return ret;  
 }
 
-static int disc_send_msg(msg_type_t msgType, const char* ip)
+#if 0
+static int disc_send_msg(msg_type_t msgType, const char* destIp, const char* destSn)
 {
     int ret = 0;
-    
+    disc_msg_t* msg = NULL;
     /* 若自身或对方没有IP时，则通过广播发送，否则通过单播发送 */
-    if (strcmp(ip, "0.0.0.0") == 0 || strcmp(g_dev_info->ip, "0.0.0.0") == 0) {
-        ret = disc_send_broadcast_msg(msgType, SN_BROADCAST);
+    if (strcmp(destIp, "0.0.0.0") == 0 || strcmp(g_dev_info->ip, "0.0.0.0") == 0) {
+        ret = disc_send_broadcast_msg(msgType, destSn);
         if (ret != 0) {
             DISC_ERROR("Send broadcast msg failed\n");
         }
     } else {
-        ret = disc_send_unicast_msg(msgType, ip);
+        ret = disc_send_unicast_msg(msgType, destIp);
         if (ret != 0) {
-            DISC_ERROR("Send unicast msg failed, dest ip: [%s]\n", ip);
+            DISC_ERROR("Send unicast msg failed, dest ip: [%s]\n", destIp);
         }
     }
 
+    return ret;
+}
+#endif
+static int disc_send_msg(msg_type_t msgType, enc_type_t encType, const char* destSn)
+{
+    int ret = 0;
+    disc_msg_t msg;
+
+    memset(&msg, 0, sizeof(disc_msg_t));
+    msg.msgHdr.version = VERISON_DEFAULT;
+    msg.msgHdr.msgType = msgType;
+    msg.msgHdr.encType = encType;
+    msg.msgHdr.payloadLen = 0;
+    msg.payload = NULL;
+
+    if(disc_get_msg_payload(&msg.payload, &msg.msgHdr.payloadLen, msg.msgHdr.encType, destSn) != 0 ) {
+        DISC_ERROR("Get msg payload failed\n");
+        ret =  -1;
+        goto end;
+    }
+    
+    if (disc_send_broadcast_msg(&msg, destSn) != 0) {
+        DISC_ERROR("Send broadcast msg failed\n");
+        ret = -1;
+    }
+
+end:
+    if (msg.payload) {
+        free(msg.payload);  
+    }
+    
+    return ret;
+}
+
+static int disc_send_declare(const char* destSn) 
+{
+    return disc_send_msg(MSG_TYPE_DECLARE, ENC_TYPE_NONE, destSn);
+}
+
+static int disc_send_reject(const char* destSn)
+{
+    return disc_send_msg(MSG_TYPE_REJECT, ENC_TYPE_NONE, destSn);;
+}
+
+static int disc_send_merge(const char* destSn)
+{
+    return disc_send_msg(MSG_TYPE_MERGE, ENC_TYPE_NONE, destSn);;
+}
+
+static int disc_send_hello(const char* destSn)
+{
+    return disc_send_msg(MSG_TYPE_HELLO, ENC_TYPE_NONE, destSn);;
+}
+
+static int disc_send_request(const char* destSn)
+{
+    return disc_send_msg(MSG_TYPE_REQUEST, ENC_TYPE_NONE, destSn);;
+}
+
+static int disc_send_response(const char* destIp,const char* destSn)
+{
+    int ret = 0;
+    disc_msg_t msg;
+
+    memset(&msg, 0, sizeof(disc_msg_t));
+    msg.msgHdr.version = VERISON_DEFAULT;
+    msg.msgHdr.msgType = MSG_TYPE_RESPONSE;
+    msg.msgHdr.encType = ENC_TYPE_NONE;
+    msg.msgHdr.payloadLen = 0;
+    msg.payload = NULL;
+
+    if(disc_get_msg_payload(&msg.payload, &msg.msgHdr.payloadLen, msg.msgHdr.encType, destSn) != 0 ) {
+        DISC_ERROR("Get msg payload failed\n");
+        ret =  -1;
+        goto end;
+    }
+    
+    /* 若自身或对方没有IP时，则通过广播发送，否则通过单播发送 */
+    if (strcmp(destIp, "0.0.0.0") == 0 || strcmp(g_dev_info->ip, "0.0.0.0") == 0) {
+        ret = disc_send_broadcast_msg(&msg, destSn);
+        if (ret != 0) {
+            DISC_ERROR("Send broadcast msg failed\n");
+            ret =  -1;
+        }
+    } else {
+        ret = disc_send_unicast_msg(&msg, destIp);
+        if (ret != 0) {
+            DISC_ERROR("Send unicast msg failed, dest ip: [%s]\n", destIp);
+            ret =  -1;
+        }
+    }
+
+end:
+    if (msg.payload) {
+        free(msg.payload);  
+    }
+    
+    return ret;
+}
+
+static int disc_get_shell_payload(char** payload, int* payloadLen, enc_type_t encType, 
+    const char* cmds, const char* destSn)
+{
+    struct json_object *root;
+    const char* str;
+
+    if (destSn == NULL) {
+        DISC_ERROR("destSn is NULL\n");
+        return -1;
+    }
+    
+    root = json_object_new_object();
+    if (root == NULL) {
+        DISC_ERROR("json_object_new_object() failed\n");
+        return -1;
+    }
+
+    /* 发送对象的SN, FFFFFFFFFFFF表示所有对象 */
+    json_object_object_add(root, "destSn", json_object_new_string(destSn)); 
+    json_object_object_add(root, "cmds", json_object_new_string(cmds));
+
+    str = json_object_to_json_string(root);
+
+    *payloadLen = strlen(str);
+    *payload = strdup(str);
+
+    //DISC_DEBUG("payload: %s\n", *payload);
+    
+    json_object_put(root);
+
+    return 0;
+}
+
+static int disc_send_shell(const char* cmds, const char* destSn)
+{
+    int ret = 0;
+    disc_msg_t msg;
+
+    memset(&msg, 0, sizeof(disc_msg_t));
+    msg.msgHdr.version = VERISON_DEFAULT;
+    msg.msgHdr.msgType = MSG_TYPE_SHELL;
+    msg.msgHdr.encType = ENC_TYPE_NONE;
+    msg.msgHdr.payloadLen = 0;
+    msg.payload = NULL;
+
+    if(disc_get_shell_payload(&msg.payload, &msg.msgHdr.payloadLen, msg.msgHdr.encType, cmds, destSn) != 0 ) {
+        DISC_ERROR("Get shell payload failed\n");
+        ret =  -1;
+        goto end;
+    }
+
+    if (disc_send_broadcast_msg(&msg, destSn) != 0) {
+        DISC_ERROR("Send broadcast msg failed\n");
+        ret = -1;
+    }
+        
+end:
+    if (msg.payload) {
+        free(msg.payload);  
+    }
+    
     return ret;
 }
 
@@ -2203,36 +2434,38 @@ static void disc_send_timer_cb(struct uloop_timeout *timer)
         case ROLE_UNKNOWN:
             /* 若连续3个declare，为收到reject, 则自身为master */
             if (g_declare_count >= 3) {
+                g_declare_count = 0;
                 (void)disc_set_role(ROLE_MASTER);
                 if (g_dev_info->ip != NULL) {
                     free(g_dev_info->ip);
                 }
                 g_dev_info->ip = strdup("127.0.0.1");
                 (void)disc_update_master_info(g_dev_info);
-                g_declare_count = 0;
+                /* 立即发送一个request报文，加快组网和邻居信息更新 */
+                (void)disc_send_request(SN_BROADCAST);
                 goto end;
             } 
             
-             if (disc_send_broadcast_msg(MSG_TYPE_DECLARE, SN_BROADCAST) == 0){
+             if (disc_send_declare(SN_BROADCAST) == 0){
                 g_declare_count ++;
                 DISC_DEBUG("Send delcare message %d times\n", g_declare_count);
             }else {
-                DISC_ERROR("disc_send_broadcast_msg() failed\n");
+                DISC_ERROR("Send delcare message failed\n");
             }            
         break;
         case ROLE_MASTER:
-            if (disc_send_broadcast_msg(MSG_TYPE_REQUEST, SN_BROADCAST) == 0) {
+            if (disc_send_request(SN_BROADCAST) == 0) {
                 DISC_DEBUG("Send request message success\n");
             } else {
-                DISC_ERROR("disc_send_broadcast_msg() failed\n");
+                DISC_ERROR("Send request message failed\n");
             }
         break;
         case ROLE_SLAVER:
             if (g_dev_cfg->hello_enable == true) {
-                if (disc_send_broadcast_msg(MSG_TYPE_HELLO, SN_BROADCAST) == 0) {
+                if (disc_send_hello(SN_BROADCAST) == 0) {
                     DISC_DEBUG("Send hello message success\n");
                 } else {
-                    DISC_ERROR("disc_send_broadcast_msg() failed\n");
+                    DISC_ERROR("Send hello message failed\n");
                 }
             }
         break;

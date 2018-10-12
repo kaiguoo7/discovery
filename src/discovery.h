@@ -17,7 +17,6 @@
 #define VERISON_DEFAULT     1
 #define DISC_IP_LEN         16
 
-
 #define NETWORKID_LEN       32
 #define NETWORKNAME_LEN     64
 
@@ -40,6 +39,7 @@ typedef enum msg_type_e {
     MSG_TYPE_HELLO      = 40,
     MSG_TYPE_REQUEST    = 50,
     MSG_TYPE_RESPONSE   = 60,
+    MSG_TYPE_SHELL      = 70,
     MSG_TYPE_MAX        = 99
 }msg_type_t;
 

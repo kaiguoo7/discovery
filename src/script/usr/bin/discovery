@@ -59,7 +59,7 @@ discovery_show()
 {
     # 支持模糊匹配
     case "$1" in 
-        neighbor|neig*) 
+        neighbor|nei*) 
             if [ -n "$2" ];then
                 ubus -t 3 call discovery neighbor "$2"
             else
@@ -75,7 +75,7 @@ discovery_show()
         cfg) 
             ubus -t 3 call discovery cfg
         ;;
-        status) 
+        status|sta*) 
             ubus -t 3 call discovery status
         ;;
         *) 
@@ -101,6 +101,11 @@ discovery_detect()
     ubus -t 3 call discovery detect
 }
 
+discovery_shell()
+{
+    ubus -t 3 call discovery shell "$@"
+}
+
 # 主流程
 if [ -z "$1" ];then
     discovery_debug close
@@ -109,6 +114,10 @@ fi
 
 #支持模糊匹配
 case "$1" in 
+    shell)
+        shift
+        discovery_shell "$@"
+    ;;
     show|sh*)
         shift
         discovery_show "$@"
@@ -120,7 +129,7 @@ case "$1" in
     close|clo*) 
         discovery_debug "close"
     ;;
-    detect|det*) 
+    updateNeigbor|up*) 
         discovery_detect
     ;;
     start|restart) 
