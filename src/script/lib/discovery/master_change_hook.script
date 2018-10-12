@@ -1,0 +1,15 @@
+#!/bin/sh
+
+#'{"masterSn":"CAL81DA013700","masterIp":"192.168.110.123"}'
+MASTER_INFO="$1"
+
+ubus_send_even()
+{
+    ubus -t 3 send "master_change"  "$MASTER_INFO" &
+}
+
+
+
+##########Master变更通告##########
+ubus_send_even
+

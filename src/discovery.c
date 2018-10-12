@@ -25,15 +25,14 @@
 #include "discovery.h"
 
 
-#define DISC_PKT_NAME           "discovery"
-#define DISC_SCT_NAME           "discovery"
-#define PRINT_INTERVAL          5
-#define QUEUE_LEN               512     /* 队列长度 */
-#define BUF_LEN                 2048
-#define OUT_TIMES               2
-#define MASTER_CHANGE_EVENT     "master_change"
-#define SN_BROADCAST            "FFFFFFFFFFFFF" /* SN广播，与正常的SN长度一样，13位 */
-
+#define DISC_PKT_NAME               "discovery"
+#define DISC_SCT_NAME               "discovery"
+#define PRINT_INTERVAL              5
+#define QUEUE_LEN                   512     /* 队列长度 */
+#define BUF_LEN                     2048
+#define OUT_TIMES                   2
+#define SN_BROADCAST                "FFFFFFFFFFFFF" /* SN广播，与正常的SN长度一样，13位 */
+#define MASTER_CHANGE_HOOK_SCRIPT   "/lib/discovery/master_change_hook.script" /* master变更时，hook脚本 */
 
 /* debug宏定义 */
 #define DISC_FILE(fmt, arg...) do { \
@@ -1102,10 +1101,12 @@ static void disc_ubus_connection_lost(struct ubus_context *ctx)
 
 static int disc_master_change_notify(const char* masterSn, const char* masterIp)
 {
-    char cmd[1024] = {0};
+    char cmd[BUF_LEN] = {0};
 
-    snprintf(cmd, sizeof(cmd), "ubus -t 3 send %s '{\"masterSn\":\"%s\",\"masterIp\":\"%s\"}' &", 
-            MASTER_CHANGE_EVENT, masterSn, masterIp);
+    snprintf(cmd, sizeof(cmd), "%s '{\"masterSn\":\"%s\",\"masterIp\":\"%s\"}'", 
+            MASTER_CHANGE_HOOK_SCRIPT, masterSn, masterIp);
+
+    /* 执行命令 */
     system(cmd);
     
     return 0;

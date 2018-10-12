@@ -49,6 +49,9 @@ define Package/$(PKG_NAME)/install
 	
 	$(INSTALL_DIR) $(1)/usr/bin/
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/script/usr/bin/* $(1)/usr/bin/
+	
+	$(INSTALL_DIR) $(1)/lib/discovery/
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/script/lib/discovery/* $(1)/lib/discovery/
 endef
 
 $(eval $(call BuildPackage,$(PKG_NAME)))     
